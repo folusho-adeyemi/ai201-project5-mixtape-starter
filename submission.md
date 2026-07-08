@@ -120,3 +120,30 @@ Mixtape is a Flask app using the **application-factory** pattern (`create_app` i
 **My fix and side-effect check.** I replaced the rolling threshold with the start of the current UTC calendar day: `cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)`, and removed the now-unused `RECENT_THRESHOLD`/`timedelta` import. Events are now included only if `listened_at >= midnight today`. Side-effect check — I verified **both sides of the boundary** with `tests/test_feed.py`: a friend who listened earlier today still appears (`test_feed_includes_todays_listeners`), and a friend who listened one minute before midnight (previous day, still < 24h ago) no longer appears (`test_feed_excludes_yesterday_evening_listeners`). The per-friend dedup and ordering logic were untouched, and `get_activity_feed` (which is intentionally not recency-filtered) is unaffected.
 
 **Regression test (new).** `tests/test_feed.py::test_feed_excludes_yesterday_evening_listeners` fails under the old 24-hour logic (the yesterday-evening play is < 24h old, so it's included) and passes after the fix; `test_feed_includes_todays_listeners` confirms today's listeners still show.
+
+### Issue #3 — The same song shows up multiple times in search
+
+**Honesty note up front:** the *symptom* (duplicate rows returned to the user) does **not** reproduce through the public `search_songs()` API in this environment, but the underlying *defect* that would cause it is real and I found and removed it. Details below.
+
+**How I reproduced it (and where it didn't).** I first called `search_songs("Anthem")` against the seeded DB (which intentionally gives "Crown Heights Anthem" three tags) expecting three copies, per simone's report — but it returned the song exactly **once**. Reproducing at the SQL layer, however, showed the defect clearly: running the service's own query shape as a raw column `select` (`select(Song.id, Song.title).outerjoin(song_tags, ...).filter(title ilike '%Anthem%')`) returned **3 identical rows** — one per tag. So the query genuinely multiplies rows; the duplication is just masked before it reaches the caller (see root cause).
+
+**How I found the root cause.** Path: `GET /songs/search` → `songs.py::search()` → `search_service.search_songs()`. The query was `db.session.query(Song).outerjoin(song_tags, Song.id == song_tags.c.song_id).filter(title/artist ilike ...)`. The `outerjoin(song_tags)` jumped out because the search neither filters nor selects on tags — the join has no purpose. Joining a one-to-many association table produces one result row per matching child row (per tag), so a 3-tag song yields 3 rows and a 0-tag song yields 1. That "conditional on tag count" behavior is exactly the hint for this issue ("some songs appear once, others two or three times").
+
+**The root cause.** `search_songs()` joined `Song` to the `song_tags` association table for no reason. That join fans out to one row per tag, so a song with N tags appears N times in the result set. Why the app doesn't visibly duplicate today: SQLAlchemy's legacy ORM `Query` for a **single mapped entity** deduplicates results through the identity map before `.all()` returns, collapsing the three `Song` rows back into one object. So the bug is latent behind ORM behavior — but it's a real defect: any change to the query (selecting extra columns, adding a tag column to the output, switching to the 2.0-style `select()` execution, or a different DB/driver) would surface the duplicates simone described, and the SQL genuinely returns 3 rows (verified above).
+
+**My fix and side-effect check.** I removed the pointless `outerjoin(song_tags)` (and the now-unused `Tag`/`song_tags` imports) so the query filters directly on `Song.title`/`Song.artist`. Tags still appear in each result because `to_dict()` reads them via the `Song.tags` relationship (`lazy="subquery"`), independent of the search join. This addresses the root cause rather than papering over it with `.distinct()` (which would also work but leaves the meaningless join in place). Side-effect check: `tests/test_search.py` passes 5/5 — including `test_search_no_duplicates_multi_tag_song` (multi-tag song appears once), the no-tag and one-tag cases (still returned exactly once), the basic match test, and the empty-result case. My SQL-level check now returns 1 row instead of 3.
+
+**Regression test.** `tests/test_search.py::test_search_no_duplicates_multi_tag_song` (already in the repo) asserts a 3-tag song appears exactly once — it is the intended guard. It passes both before and after in this SQLAlchemy version because of the identity-map dedup described above, so it does not fully protect against the latent defect; the SQL-level check in this entry is what actually demonstrates the fix.
+
+---
+
+## Summary of commits
+
+| Commit | Issue | Change |
+|---|---|---|
+| `docs:` | — | Codebase map, AI usage, orientation |
+| `fix:` streak | #1 | Remove Sunday guard from consecutive-day branch |
+| `fix:` playlist | #5 | Return all songs (drop the `[:-1]` slice) |
+| `fix:` rating notification | #4 | Notify sharer on rating, mirroring playlist-add |
+| `fix:` feed | #2 | Scope Listening Now to today, not rolling 24h |
+| `fix:` search | #3 | Remove unnecessary `song_tags` join |
