@@ -8,7 +8,7 @@ Bugs fixed (each is its own commit): **#1 streak, #5 playlist, #4 rating notific
 
 ## AI Usage
 
-I used an AI coding assistant (Cursor) primarily for **codebase navigation and code explanation**, and verified every diagnosis by reading the code and running it myself.
+I used an AI coding assistant (Cursor) primarily for **codebase navigation and code explanation**, and verified every diagnosis by reading the code and running it myself .
 
 - **Orientation / file summaries.** I asked the assistant to summarize what each `services/*.py` module is responsible for and to trace call chains (route → service → model). This produced the first draft of the codebase map below, which I then checked line-by-line against the actual files.
 - **Trace a data flow.** I asked it to trace "how does rating a song reach a notification?" — this is what surfaced that `rate_song()` in `notification_service.py` never calls `create_notification()`, unlike `add_to_playlist()`. I confirmed by reading both functions side by side.
