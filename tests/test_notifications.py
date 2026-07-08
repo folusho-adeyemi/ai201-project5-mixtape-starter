@@ -9,8 +9,13 @@ original sharer, the same way adding it to a playlist does.
 
 import pytest
 from app import create_app, db
-from models import User, Song
-from services.notification_service import rate_song, get_notifications
+from models import User, Song, Playlist
+from services.notification_service import (
+    rate_song,
+    add_to_playlist,
+    get_notifications,
+)
+from services.playlist_service import get_playlist_songs
 
 
 @pytest.fixture
@@ -33,9 +38,13 @@ def seed(app):
 
         song = Song(title="Neon City", artist="Static Era", shared_by=sharer.id)
         db.session.add(song)
+        db.session.flush()
+
+        playlist = Playlist(name="Friday Energy", created_by=friend.id)
+        db.session.add(playlist)
         db.session.commit()
 
-        yield {"sharer": sharer, "friend": friend, "song": song}
+        yield {"sharer": sharer, "friend": friend, "song": song, "playlist": playlist}
 
 
 def test_rating_a_song_notifies_the_sharer(app, seed):
@@ -64,3 +73,39 @@ def test_rating_your_own_song_does_not_notify(app, seed):
         rate_song(sharer_id, song_id, 4)
 
         assert get_notifications(sharer_id) == []
+
+
+def test_add_to_playlist_persists_song_with_position(app, seed):
+    """
+    Adding a song to a playlist must insert a playlist_entries row with the
+    NOT NULL position/added_by columns set (regression: the relationship-append
+    path left them null and raised IntegrityError), and notify the sharer.
+    """
+    with app.app_context():
+        sharer_id = seed["sharer"].id
+        friend_id = seed["friend"].id
+        song_id = seed["song"].id
+        playlist_id = seed["playlist"].id
+
+        add_to_playlist(playlist_id, song_id, friend_id)
+
+        songs = get_playlist_songs(playlist_id)
+        assert [s["id"] for s in songs] == [song_id]
+
+        notifs = get_notifications(sharer_id)
+        assert len(notifs) == 1
+        assert notifs[0]["type"] == "song_added_to_playlist"
+
+
+def test_add_to_playlist_is_idempotent(app, seed):
+    """Adding the same song twice should not create a duplicate playlist entry."""
+    with app.app_context():
+        friend_id = seed["friend"].id
+        song_id = seed["song"].id
+        playlist_id = seed["playlist"].id
+
+        add_to_playlist(playlist_id, song_id, friend_id)
+        add_to_playlist(playlist_id, song_id, friend_id)
+
+        songs = get_playlist_songs(playlist_id)
+        assert len(songs) == 1

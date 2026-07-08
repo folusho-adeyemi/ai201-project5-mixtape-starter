@@ -105,7 +105,7 @@ Mixtape is a Flask app using the **application-factory** pattern (`create_app` i
 
 **My fix and side-effect check.** After the rating commit, I added the same guarded notification the playlist path uses: if `song.shared_by != user_id`, call `create_notification(user_id=song.shared_by, notification_type="song_rated", body=f"{rater.username} rated your song '{song.title}' {score} stars.")`. I placed it after the commit so a failed rating never emits a notification, and guarded on `song.shared_by != user_id` so users don't get notified for rating their own songs — mirroring the playlist path's self-check. Side-effect check: I added `tests/test_notifications.py` (3 tests) covering the notify-on-rate, no-self-notify, and existing playlist path, and re-ran the whole suite (15/15 pass), confirming rating updates (the existing-rating branch) and the score-validation path still work.
 
-**Note (out of scope).** While writing the regression test I found that `add_to_playlist()` inserts via the `playlist.songs.append(...)` relationship, which does not populate the `NOT NULL` `position`/`added_by` columns on `playlist_entries` and raises an `IntegrityError`. That is a separate defect from the five assigned issues, so I left it untouched and did not couple my regression test to that path.
+**Note (extra bug found & fixed).** While writing the regression test I found that `add_to_playlist()` inserted via the `playlist.songs.append(...)` relationship, which does not populate the `NOT NULL` `position`/`added_by` columns on `playlist_entries` and raised an `IntegrityError` on `POST /playlists/<id>/songs`. This is a separate defect from the five assigned issues; I fixed it in its own commit (see "Additional fix" below).
 
 **Regression test (new).** `tests/test_notifications.py::test_rating_a_song_notifies_the_sharer` fails before this fix (0 notifications) and passes after; `test_rating_your_own_song_does_not_notify` guards the self-rating edge case.
 
@@ -135,6 +135,14 @@ Mixtape is a Flask app using the **application-factory** pattern (`create_app` i
 
 **Regression test.** `tests/test_search.py::test_search_no_duplicates_multi_tag_song` (already in the repo) asserts a 3-tag song appears exactly once — it is the intended guard. It passes both before and after in this SQLAlchemy version because of the identity-map dedup described above, so it does not fully protect against the latent defect; the SQL-level check in this entry is what actually demonstrates the fix.
 
+### Additional fix (not one of the five) — Adding a song to a playlist crashed
+
+**How I found it.** Writing the Issue #4 regression test, a test that exercised `add_to_playlist()` failed with `sqlalchemy.exc.IntegrityError: NOT NULL constraint failed: playlist_entries.position`.
+
+**The root cause.** `add_to_playlist()` added songs with `playlist.songs.append(song)`. The `Playlist.songs` relationship goes through the `playlist_entries` association table, which has `NOT NULL` `position` and `added_by` columns with no defaults. A relationship append only sets the two foreign keys (`playlist_id`, `song_id`), so the insert violated the `NOT NULL` constraints and raised `IntegrityError` — meaning `POST /playlists/<id>/songs` (the endpoint Issue #5's reporter used to add songs) actually 500s.
+
+**The fix.** Insert the association row explicitly with `playlist_entries.insert().values(...)`, computing `position = max(existing position) + 1` and setting `added_by` to the adding user. I kept it idempotent by first checking whether the `(playlist_id, song_id)` pair already exists. Verified with `tests/test_notifications.py::test_add_to_playlist_persists_song_with_position` and `::test_add_to_playlist_is_idempotent`.
+
 ---
 
 ## Summary of commits
@@ -147,3 +155,4 @@ Mixtape is a Flask app using the **application-factory** pattern (`create_app` i
 | `fix:` rating notification | #4 | Notify sharer on rating, mirroring playlist-add |
 | `fix:` feed | #2 | Scope Listening Now to today, not rolling 24h |
 | `fix:` search | #3 | Remove unnecessary `song_tags` join |
+| `fix:` playlist add | extra | Insert `playlist_entries` row with `position`/`added_by` (was crashing) |
