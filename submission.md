@@ -71,4 +71,14 @@ Mixtape is a Flask app using the **application-factory** pattern (`create_app` i
 
 ## Root Cause Analysis
 
-_(entries added per fix, below)_
+### Issue #1 — My listening streak keeps resetting (Sunday)
+
+**How I reproduced it.** The existing test `tests/test_streaks.py::test_streak_increments_on_sunday` sets a Saturday listen (streak → 1) then a Sunday listen and asserts the streak becomes 2. Running `pytest tests/test_streaks.py` showed it failing with `assert 1 == 2` — the streak reset to 1 on Sunday instead of incrementing. That matches kenji's report exactly (streak thrown away, both times on a Sunday).
+
+**How I found the root cause.** Route path: `GET /users/<id>/streak` → `users.py::streak()` → `streak_service.get_streak()` just reads the stored value, so the corruption had to happen at *write* time in `record_listening_event()` → `update_listening_streak()`. Reading `update_listening_streak()`, the consecutive-day branch was `elif days_since_last == 1 and today.weekday() != 6:`. The `weekday() != 6` guard jumped out — 6 is Sunday. I confirmed by checking `datetime(2024, 6, 16).weekday()` → `6`, so on any Sunday the "listened yesterday" branch is skipped and execution falls through to the `else`, which resets the streak to 1.
+
+**The root cause.** Python's `datetime.weekday()` returns `6` for Sunday. The consecutive-day branch had an extra, unjustified condition `today.weekday() != 6`, so when a user listened on consecutive days but the *second* day was a Sunday, `days_since_last == 1` was `True` but `today.weekday() != 6` was `False`. The `and` short-circuited the whole branch to `False`, execution fell into the `else`, and the streak was reset to 1 — even though no day had actually been skipped. Every week boundary that landed on Sunday wiped the streak.
+
+**My fix and side-effect check.** I removed the spurious `and today.weekday() != 6` guard so the branch is simply `elif days_since_last == 1:`. The streak now increments whenever the previous listen was exactly one calendar day ago, on any weekday. Side-effect check: I re-ran all of `test_streaks.py` (5/5 pass), which covers **both sides of the boundary** — `test_streak_resets_after_skipped_day` still passes (a genuinely skipped day still resets to 1) and `test_streak_does_not_double_count_same_day` still passes (same-day replays don't increment). So the fix restores Sunday increments without weakening the real reset behavior.
+
+**Regression test.** `tests/test_streaks.py::test_streak_increments_on_sunday` (already in the repo) fails before this fix and passes after — it is the regression guard for this bug.
